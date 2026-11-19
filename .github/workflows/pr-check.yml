@@ -1,0 +1,49 @@
+name: pr-check
+
+# pull_request_target runs the workflow as it is on main, so a pull
+# request cannot change the check that judges it. It never checks out
+# or runs pull request code: it only reads the description from the
+# event payload.
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+jobs:
+  pr-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the review box and the AI usage declaration
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+          ASSOCIATION: ${{ github.event.pull_request.author_association }}
+        run: |
+          set -euo pipefail
+          body=$(printf '%s\n' "$BODY" | tr -d '\r')
+          box='^[[:space:]]*[-*][[:space:]]+\[[xX]\][[:space:]]+'
+          status=0
+
+          if ! grep -qE "${box}I reviewed the full diff myself[[:space:]]*$" <<<"$body"; then
+            echo "::error::Tick \"I reviewed the full diff myself\" in the pull request description."
+            status=1
+          fi
+
+          case "$ASSOCIATION" in
+            OWNER|MEMBER|COLLABORATOR)
+              echo "Author has write access ($ASSOCIATION): the AI usage section is not required."
+              ;;
+            *)
+              ticked=$(grep -cE "${box}(No AI tools were used|AI-assisted|Mostly AI-generated)[[:space:]]*$" <<<"$body" || true)
+              if [ "$ticked" -ne 1 ]; then
+                echo "::error::Tick exactly one option in the \"AI usage\" section (ticked: $ticked)."
+                status=1
+              elif grep -qE "${box}(AI-assisted|Mostly AI-generated)[[:space:]]*$" <<<"$body" \
+                && ! grep -qE '^[[:space:]]*Tools:[[:space:]]*[^[:space:]]' <<<"$body"; then
+                echo "::error::Name the AI tools on the \"Tools:\" line of the \"AI usage\" section."
+                status=1
+              fi
+              ;;
+          esac
+
+          exit "$status"

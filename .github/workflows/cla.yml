@@ -1,0 +1,187 @@
+name: cla
+
+# Checks that every author of a pull request accepted CLA.md and records
+# acceptances in lleme-dev/cla-signatures. pull_request_target runs this
+# file as it is on main and nothing here checks out or runs pull request
+# code: all data comes from the API. The result is the commit status
+# `cla` on the head commit, so a run started by a comment also updates
+# the pull request. Any error leaves that status failing.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  check:
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event.issue.pull_request &&
+       github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CLA_SIGNATURES_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
+        with:
+          script: |
+            const PHRASE = 'I have read the CLA Document and I hereby sign the CLA';
+            const EXEMPT_LABEL = 'cla-exempt';
+            // Account ids, not logins: a login can be renamed and reused.
+            const EXEMPT = new Map([
+              [233200889, 'zyniatech'],
+              [49699333, 'dependabot[bot]'],
+            ]);
+            const SIGNATURES = { owner: 'lleme-dev', repo: 'cla-signatures', path: 'signatures/v1/cla.json' };
+            const MARKER = '<!-- cla-check -->';
+            const MAX_COMMITS = 250;
+
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request?.number ?? context.payload.issue?.number;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            let headSha;
+
+            const setStatus = (state, description) =>
+              github.rest.repos.createCommitStatus({
+                owner, repo, sha: headSha, state, context: 'cla',
+                description: description.slice(0, 140), target_url: runUrl,
+              });
+
+            async function upsertComment(body) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: number, per_page: 100,
+              });
+              const existing = comments.find((c) => c.user?.type === 'Bot' && c.body?.includes(MARKER));
+              if (existing) {
+                if (existing.body !== body) {
+                  await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+                }
+              } else if (body.includes('must accept')) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+              }
+            }
+
+            async function readSignatures(client) {
+              try {
+                const { data } = await client.rest.repos.getContent(SIGNATURES);
+                const parsed = JSON.parse(Buffer.from(data.content, 'base64').toString('utf8'));
+                if (!Array.isArray(parsed.signatures)) throw new Error('signatures file has no "signatures" array');
+                return { list: parsed.signatures, sha: data.sha };
+              } catch (error) {
+                if (error.status === 404) return { list: [], sha: undefined };
+                throw error;
+              }
+            }
+
+            async function recordSignature(client, entry) {
+              for (let attempt = 1; attempt <= 3; attempt++) {
+                const { list, sha } = await readSignatures(client);
+                if (list.some((s) => s.user_id === entry.user_id)) return;
+                const content = JSON.stringify({ signatures: [...list, entry] }, null, 2) + '\n';
+                try {
+                  await client.rest.repos.createOrUpdateFileContents({
+                    ...SIGNATURES, sha,
+                    message: `Record CLA acceptance by ${entry.login}`,
+                    content: Buffer.from(content, 'utf8').toString('base64'),
+                  });
+                  return;
+                } catch (error) {
+                  if ((error.status === 409 || error.status === 422) && attempt < 3) continue;
+                  throw error;
+                }
+              }
+            }
+
+            try {
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+              headSha = pr.head.sha;
+              if (pr.state !== 'open') return;
+              await setStatus('pending', 'Checking the contributor license agreement');
+
+              if (pr.labels.some((l) => l.name === EXEMPT_LABEL)) {
+                await setStatus('success', `Exempt: ${EXEMPT_LABEL} label applied by a maintainer`);
+                return;
+              }
+
+              const { data: doc } = await github.rest.repos.getContent({ owner, repo, path: 'CLA.md', ref: pr.base.ref });
+              const text = Buffer.from(doc.content, 'base64').toString('utf8');
+              const version = text.match(/^Version (\S+)\s*$/m)?.[1];
+              if (!version) throw new Error('CLA.md has no "Version" line');
+              if (!text.split('\n').some((line) => line.trim() === `> ${PHRASE}`)) {
+                throw new Error('CLA.md does not contain the signing phrase');
+              }
+
+              if (pr.commits > MAX_COMMITS) throw new Error(`more than ${MAX_COMMITS} commits; the API cannot list them all`);
+              const commits = await github.paginate(github.rest.pulls.listCommits, {
+                owner, repo, pull_number: number, per_page: 100,
+              });
+              const required = new Map([[pr.user.id, pr.user.login]]);
+              const unlinked = [];
+              const coAuthored = [];
+              for (const c of commits) {
+                if (c.author?.id) required.set(c.author.id, c.author.login);
+                else unlinked.push(c.sha.slice(0, 7));
+                if (/^co-authored-by:/im.test(c.commit.message)) coAuthored.push(c.sha.slice(0, 7));
+              }
+              for (const id of EXEMPT.keys()) required.delete(id);
+
+              const token = process.env.CLA_SIGNATURES_TOKEN;
+              if (!token) throw new Error('CLA_SIGNATURES_TOKEN is not set');
+              const signatures = getOctokit(token);
+
+              if (context.eventName === 'issue_comment') {
+                const comment = context.payload.comment;
+                if (comment.body === PHRASE && required.has(comment.user.id)) {
+                  await recordSignature(signatures, {
+                    user_id: comment.user.id,
+                    login: comment.user.login,
+                    signed_at: comment.created_at,
+                    pull_request: pr.html_url,
+                    comment_url: comment.html_url,
+                    cla_version: version,
+                    cla_blob_sha: doc.sha,
+                  });
+                }
+              }
+
+              const { list } = await readSignatures(signatures);
+              const signed = new Set(list.map((s) => s.user_id));
+              const missing = [...required].filter(([id]) => !signed.has(id)).map(([, login]) => login);
+
+              const problems = [];
+              if (missing.length) {
+                problems.push(
+                  `These accounts must accept the [contributor license agreement](${pr.base.repo.html_url}/blob/${pr.base.ref}/CLA.md) ` +
+                  `by posting this exact comment, from their own account:\n\n` +
+                  `> ${PHRASE}\n\n` + missing.map((l) => `- @${l}`).join('\n'));
+              }
+              if (unlinked.length) {
+                problems.push(`These commits have an author email that is not linked to a GitHub account, so the author cannot be checked: ${unlinked.join(', ')}.`);
+              }
+              if (coAuthored.length) {
+                problems.push(`These commits have co-authors, who cannot be checked automatically. A maintainer will review them: ${coAuthored.join(', ')}.`);
+              }
+
+              if (problems.length) {
+                await upsertComment(`${MARKER}\n${problems.join('\n\n')}`);
+                await setStatus('failure', missing.length ? `Not signed: ${missing.join(', ')}` : 'Commit authors cannot be checked');
+                core.setFailed(problems.join('\n'));
+              } else {
+                await upsertComment(`${MARKER}\nAll commit authors have accepted the contributor license agreement.`);
+                await setStatus('success', 'All commit authors have accepted the CLA');
+              }
+            } catch (error) {
+              core.setFailed(`CLA check failed: ${error.message}`);
+              if (headSha) {
+                try {
+                  await setStatus('error', 'The CLA check could not run; see the workflow log');
+                } catch (statusError) {
+                  core.error(`Could not set the cla status: ${statusError.message}`);
+                }
+              }
+            }
