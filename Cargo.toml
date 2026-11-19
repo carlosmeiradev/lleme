@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/server", "crates/edge"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.100.0"
+license = "AGPL-3.0-only"
+repository = "https://github.com/lleme-dev/lleme"
+publish = false
