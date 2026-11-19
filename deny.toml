@@ -1,0 +1,42 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+unused-allowed-license = "allow"
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+]
+
+# The project's own crates are AGPL; no dependency may be.
+[[licenses.exceptions]]
+crate = "lleme-core"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+crate = "lleme-server"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+crate = "lleme-edge"
+allow = ["AGPL-3.0-only"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
